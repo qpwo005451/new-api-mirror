@@ -1,0 +1,74 @@
+name: Mirror upstream main
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force-reset main even if it has commits upstream does not (bootstrap/repair)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-main
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: QuantumNous/new-api main -> fork main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Configure SSH deploy key
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.MIRROR_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Fetch both sides
+        run: |
+          set -euo pipefail
+          git init -q repo && cd repo
+          git remote add origin git@github.com:qpwo005451/new-api.git
+          git remote add upstream https://github.com/QuantumNous/new-api.git
+          git fetch -q --no-tags origin main:refs/remotes/origin/main
+          git fetch -q --no-tags upstream main:refs/remotes/upstream/main
+          echo "origin/main   = $(git rev-parse refs/remotes/origin/main)"
+          echo "upstream/main = $(git rev-parse refs/remotes/upstream/main)"
+
+      - name: Fast-forward, force, or refuse
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          cd repo
+          cur=$(git rev-parse refs/remotes/origin/main)
+          new=$(git rev-parse refs/remotes/upstream/main)
+
+          if [ "$cur" = "$new" ]; then
+            echo "already aligned; verifying write access with a dry-run push"
+            git push --dry-run origin refs/remotes/upstream/main:refs/heads/main
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "$cur" "$new"; then
+            echo "fast-forwarding main $cur -> $new"
+            git push origin refs/remotes/upstream/main:refs/heads/main
+            exit 0
+          fi
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "main has commits upstream does not; force-resetting $cur -> $new"
+            git push origin refs/remotes/upstream/main:refs/heads/main \
+              --force-with-lease=refs/heads/main:"$cur"
+            exit 0
+          fi
+
+          echo "::error::main has commits not present in upstream/main. Refusing to overwrite. Create a backup tag, then re-run with force=true."
+          git log --oneline "$new..$cur" | head -20
+          exit 1
